@@ -1,0 +1,34 @@
+<resources>
+    <string name="app_name">kotflow</string>
+
+    <string name="picture">Picture</string>
+    <string name="description_info">Info</string>
+
+    <string name="tfe_ic_app_name" translation_description="Image Classification demo app [CHAR_LIMIT=40]">TFL Classify</string>
+    <string name="tfe_ic_camera_error" translation_description="Error regarding camera support[CHAR_LIMIT=40]">This device doesn\'t support Camera2 API.</string>
+    <string name="tfe_ic_gpu_quant_error" translation_description="Error regarding GPU support for Quant models[CHAR_LIMIT=60]">GPU does not yet supported quantized models.</string>
+    <string name="tfe_ic_model" translatable="false">Model:</string>
+    <string-array name="tfe_ic_models" translatable="false">
+        <item>Quantized_EfficientNet</item>
+        <item>Float_EfficientNet</item>
+        <item>Quantized_MobileNet</item>
+        <item>Float_MobileNet</item>
+    </string-array>
+
+    <string name="tfe_ic_device" translatable="false">Device:</string>
+    <string name="frame">Frame</string>
+    <string name="_640_480">640*480</string>
+    <string name="threads">Threads</string>
+    <string name="rotation">Rotation</string>
+    <string name="view">View</string>
+    <string name="crop">Crop</string>
+    <string name="chevron_up">Chevron up</string>
+    <string name="inference_time">Inference Time</string>
+    <string name="decrease_threads">Decrease threads</string>
+    <string name="increase_threads">Increase threads</string>
+    <string-array name="tfe_ic_devices" translatable="false">
+        <item>CPU</item>
+        <!-- TODO: Add GPU  -->
+
+    </string-array>
+</resources>
