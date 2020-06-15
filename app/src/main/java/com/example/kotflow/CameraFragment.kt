@@ -5,9 +5,14 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraManager
+import android.media.ImageReader
+import android.media.ImageWriter
 import android.os.Bundle
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.SystemClock
 import android.renderscript.Allocation
 import android.renderscript.Element
@@ -19,7 +24,6 @@ import android.view.*
 import android.widget.Toast
 import androidx.databinding.DataBindingUtil
 import androidx.fragment.app.Fragment
-import androidx.lifecycle.ViewModelProvider
 import com.example.kotflow.databinding.LayoutCamBinding
 import com.example.kotflow.rs.NnInputPipeline
 import kotlinx.android.synthetic.main.layout_cam.*
@@ -29,12 +33,12 @@ import timber.log.Timber
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicBoolean
 
 // All NN setup to helper.
 // Figure out orientations.
 // Add segmentation model.
 // Make hamburger with options.
-
 
 class CameraFragment : Fragment() {
     companion object {
@@ -46,6 +50,11 @@ class CameraFragment : Fragment() {
     private val blurRadius = 1F
 
     private lateinit var cameraController: CameraController
+    private lateinit var imageReader: ImageReader
+    private lateinit var backgroundThread: HandlerThread
+    private lateinit var backgroundHandler: Handler
+
+    private var isInferenceBusy = AtomicBoolean(false)
 
     // NN configs -> to json / options.
     private val tfModelPath = "mobilenet-v2.tflite"
@@ -79,10 +88,15 @@ class CameraFragment : Fragment() {
         // Set the lifecycleOwner so DataBinding can observe LiveData
         binding.lifecycleOwner = viewLifecycleOwner
 
+        backgroundThread = HandlerThread("CameraBackground");
+        backgroundThread.start();
+        backgroundHandler = Handler(backgroundThread.looper);
+
         // Switch between the TF and Pytorch models here by commenting/uncommenting.
         model = TfModel(context!!, tfModelPath, imageProcessor, inferenceThreads, tfBackend)
 //        model = PyTorchModel(context!!.assets, ptModelPath, 224, 224, inferenceThreads)
-        inferenceInBitmap = Bitmap.createBitmap(model.inWidth, model.inHeight, Bitmap.Config.ARGB_8888)
+        inferenceInBitmap =
+            Bitmap.createBitmap(model.inWidth, model.inHeight, Bitmap.Config.ARGB_8888)
 
         rs = RenderScript.create(context)
 
@@ -149,19 +163,39 @@ class CameraFragment : Fragment() {
         texture.setDefaultBufferSize(model.inWidth, model.inHeight)
         outViewAlloc.surface = Surface(texture)
 
-        var frameCount = 0
+        var inferenceFrameCount = 0
+        var overallFrameCount = 0
         var startTime = -1L
         var inferenceTime = 0L
+        var preprocTime = 0L
 
-        nnVideoPreproc.inAlloc.setOnBufferAvailableListener { a ->
+        val surfaceWriter = ImageWriter.newInstance(
+            nnVideoPreproc.inAlloc.surface, 2)
+        imageReader = ImageReader.newInstance(
+            inVideoSize.width, inVideoSize.height, ImageFormat.YUV_420_888, 2)
+        imageReader.setOnImageAvailableListener(
+            { reader ->
+                val img = reader.acquireLatestImage()
+                img?.also {
+                    overallFrameCount++
+                    if (isInferenceBusy.compareAndSet(false, true)) {
+                        surfaceWriter.queueInputImage(it)
+                    } else {
+                        it.close()
+                    }
+                }
+            },
+            backgroundHandler
+        )
+
+        nnVideoPreproc.inAlloc.setOnBufferAvailableListener { alloc ->
             if (startTime < 0) {
                 startTime = SystemClock.uptimeMillis()
             }
 
-            a.ioReceive()
+            val ioStart = SystemClock.uptimeMillis()
 
-            // TODO farm out heavy image processing to a separate thread to skip the
-            //      accumulating frames quickly.
+            alloc.ioReceive()
             nnVideoPreproc.run()
             nnVideoPreproc.outAlloc.copyTo(inferenceInBitmap)
 
@@ -170,21 +204,27 @@ class CameraFragment : Fragment() {
             model.inferBitmap(inferenceInBitmap)
 
             inferenceTime += SystemClock.uptimeMillis() - inferenceStart
+            preprocTime += inferenceStart - ioStart
 
             outViewAlloc.copyFrom(inferenceInBitmap)
             outViewAlloc.ioSend()
 
             val walltimeSinceStarted = SystemClock.uptimeMillis() - startTime
 
-            frameCount++
-            if (frameCount % 100 == 0) {
-                Log.i("CameraFragment",
-                    "Frame $frameCount took $walltimeSinceStarted ms. " +
-                            "Inference wall time $inferenceTime.")
+            inferenceFrameCount++
+            if (inferenceFrameCount % 100 == 0) {
+                Log.i(
+                    "CameraFragment",
+                    "Frame $inferenceFrameCount took $walltimeSinceStarted ms. " +
+                            "Preproc time $preprocTime. Inference wall time $inferenceTime." +
+                            "Skipped ${overallFrameCount - inferenceFrameCount} frames."
+                )
             }
+
+            isInferenceBusy.set(false)
         }
 
-        cameraController.start(nnVideoPreproc.inAlloc.surface)
+        cameraController.start(imageReader.surface)
     }
 }
 
