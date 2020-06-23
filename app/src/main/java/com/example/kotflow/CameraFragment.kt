@@ -33,6 +33,8 @@ import timber.log.Timber
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 // All NN setup to helper.
@@ -55,6 +57,7 @@ class CameraFragment : Fragment() {
     private lateinit var backgroundHandler: Handler
 
     private var isInferenceBusy = AtomicBoolean(false)
+    private var isFrameAvailableLatch = CountDownLatch(1)
 
     // NN configs -> to json / options.
     private val tfModelPath = "mobilenet-v2.tflite"
@@ -67,6 +70,8 @@ class CameraFragment : Fragment() {
     private val imageProcessor = ImageProcessor.Builder()
         .add(NormalizeOp(0F, 255F))
         .build()
+
+    private val inferenceExecutor = Executors.newSingleThreadExecutor()
 
     private lateinit var model: NnModel
 
@@ -93,8 +98,10 @@ class CameraFragment : Fragment() {
         backgroundHandler = Handler(backgroundThread.looper);
 
         // Switch between the TF and Pytorch models here by commenting/uncommenting.
-        model = TfModel(context!!, tfModelPath, imageProcessor, inferenceThreads, tfBackend)
-//        model = PyTorchModel(context!!.assets, ptModelPath, 224, 224, inferenceThreads)
+        inferenceExecutor.submit {
+            model = TfModel(context!!, tfModelPath, imageProcessor, inferenceThreads, tfBackend)
+//          model = PyTorchModel(context!!.assets, ptModelPath, 224, 224, inferenceThreads)
+        }.get()
         inferenceInBitmap =
             Bitmap.createBitmap(model.inWidth, model.inHeight, Bitmap.Config.ARGB_8888)
 
@@ -169,17 +176,19 @@ class CameraFragment : Fragment() {
         var inferenceTime = 0L
         var preprocTime = 0L
 
-        val surfaceWriter = ImageWriter.newInstance(
-            nnVideoPreproc.inAlloc.surface, 2)
+        val inAllocWriter = ImageWriter.newInstance(
+            nnVideoPreproc.inAlloc.surface, 2
+        )
         imageReader = ImageReader.newInstance(
-            inVideoSize.width, inVideoSize.height, ImageFormat.YUV_420_888, 2)
+            inVideoSize.width, inVideoSize.height, ImageFormat.YUV_420_888, 2
+        )
         imageReader.setOnImageAvailableListener(
             { reader ->
                 val img = reader.acquireLatestImage()
                 img?.also {
                     overallFrameCount++
                     if (isInferenceBusy.compareAndSet(false, true)) {
-                        surfaceWriter.queueInputImage(it)
+                        inAllocWriter.queueInputImage(it)
                     } else {
                         it.close()
                     }
@@ -188,40 +197,49 @@ class CameraFragment : Fragment() {
             backgroundHandler
         )
 
-        nnVideoPreproc.inAlloc.setOnBufferAvailableListener { alloc ->
-            if (startTime < 0) {
-                startTime = SystemClock.uptimeMillis()
+        nnVideoPreproc.inAlloc.setOnBufferAvailableListener {
+            isFrameAvailableLatch.countDown()
+        }
+
+        inferenceExecutor.submit {
+            while (true) {
+                isFrameAvailableLatch.await()
+
+                if (startTime < 0) {
+                    startTime = SystemClock.uptimeMillis()
+                }
+
+                val ioStart = SystemClock.uptimeMillis()
+
+                nnVideoPreproc.inAlloc.ioReceive()
+                nnVideoPreproc.run()
+                nnVideoPreproc.outAlloc.copyTo(inferenceInBitmap)
+
+                val inferenceStart = SystemClock.uptimeMillis()
+
+                model.inferBitmap(inferenceInBitmap)
+
+                inferenceTime += SystemClock.uptimeMillis() - inferenceStart
+                preprocTime += inferenceStart - ioStart
+
+                outViewAlloc.copyFrom(inferenceInBitmap)
+                outViewAlloc.ioSend()
+
+                val walltimeSinceStarted = SystemClock.uptimeMillis() - startTime
+
+                inferenceFrameCount++
+                if (inferenceFrameCount % 100 == 0) {
+                    Log.i(
+                        "CameraFragment",
+                        "Frame $inferenceFrameCount took $walltimeSinceStarted ms. " +
+                                "Preproc time $preprocTime. Inference wall time $inferenceTime." +
+                                "Skipped ${overallFrameCount - inferenceFrameCount} frames."
+                    )
+                }
+
+                isFrameAvailableLatch = CountDownLatch(1)
+                isInferenceBusy.set(false)
             }
-
-            val ioStart = SystemClock.uptimeMillis()
-
-            alloc.ioReceive()
-            nnVideoPreproc.run()
-            nnVideoPreproc.outAlloc.copyTo(inferenceInBitmap)
-
-            val inferenceStart = SystemClock.uptimeMillis()
-
-            model.inferBitmap(inferenceInBitmap)
-
-            inferenceTime += SystemClock.uptimeMillis() - inferenceStart
-            preprocTime += inferenceStart - ioStart
-
-            outViewAlloc.copyFrom(inferenceInBitmap)
-            outViewAlloc.ioSend()
-
-            val walltimeSinceStarted = SystemClock.uptimeMillis() - startTime
-
-            inferenceFrameCount++
-            if (inferenceFrameCount % 100 == 0) {
-                Log.i(
-                    "CameraFragment",
-                    "Frame $inferenceFrameCount took $walltimeSinceStarted ms. " +
-                            "Preproc time $preprocTime. Inference wall time $inferenceTime." +
-                            "Skipped ${overallFrameCount - inferenceFrameCount} frames."
-                )
-            }
-
-            isInferenceBusy.set(false)
         }
 
         cameraController.start(imageReader.surface)
